@@ -1,0 +1,177 @@
+name: Build AltStore source
+
+on:
+  release:
+    types: [published, edited, deleted]
+  schedule:
+    - cron: "0 */6 * * *"      # safety net: re-sync every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: altstore-source
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPO: itzzace/ytkace
+  OUTPUT_FILE: altstore.json
+  INCLUDE_PRERELEASES: "false"
+
+  # Source / app metadata (edit to taste)
+  SOURCE_NAME: "ytkace Source"
+  SOURCE_IDENTIFIER: "com.itzzace.ytkace.source"
+  SOURCE_SUBTITLE: "Releases from itzzace/ytkace"
+  APP_NAME: "Youtube"
+  BUNDLE_ID: "com.google.ios.youtube"
+  CATEGORY: "entertainment"
+  DEVELOPER_NAME: "itzzace"
+  APP_SUBTITLE: ""
+  ICON_URL: ""                       # direct URL to a PNG icon
+  TINT_COLOR: "#FF0000"
+  MIN_OS_VERSION: "17.0"             # the iOS 16 builds are excluded
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate AltStore source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: python
+        run: |
+          import json, os, re, urllib.request
+
+          E = os.environ
+          repo = E["SOURCE_REPO"]
+          api = f"https://api.github.com/repos/{repo}"
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {E['GH_TOKEN']}",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def get(url):
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req) as r:
+                  return json.load(r)
+
+          def vtuple(v):
+              return tuple(int(x) for x in v.split("."))
+
+          def ipa_version(name):
+              """YouTube version at the end of the file name,
+              e.g. YTKACE_1.1.5_YouTube_21.44.4.ipa -> 21.44.4"""
+              m = re.search(r"(\d+(?:\.\d+)+)(?=[^\d.]*\.ipa$)", name, re.I)
+              return m.group(1) if m else None
+
+          def is_ios16(name):
+              return re.search(r"ios[\s._-]?16", name, re.I) is not None
+
+          def pick_ipa(assets):
+              """Drop iOS 16 builds. If several IPAs remain, take the one
+              with the highest YouTube version (the iOS 16 build is always
+              the older YouTube version)."""
+              ipas = [a for a in assets
+                      if a["name"].lower().endswith(".ipa")
+                      and not is_ios16(a["name"])
+                      and ipa_version(a["name"])]
+              if not ipas:
+                  return None
+              return max(ipas, key=lambda a: vtuple(ipa_version(a["name"])))
+
+          # ---- fetch all releases (paginated) ----
+          releases, page = [], 1
+          while True:
+              batch = get(f"{api}/releases?per_page=100&page={page}")
+              if not batch:
+                  break
+              releases += batch
+              page += 1
+
+          include_pre = E["INCLUDE_PRERELEASES"].lower() == "true"
+          versions = []
+          for rel in releases:
+              if rel["draft"] or (rel["prerelease"] and not include_pre):
+                  continue
+              ipa = pick_ipa(rel["assets"])
+              if not ipa:
+                  continue
+
+              yt_version = ipa_version(ipa["name"])
+
+              # marketing version from the release title, e.g. "YTKACE v1.1.5"
+              m = re.search(r"v?(\d+(?:\.\d+)+)", rel.get("name") or "") \
+                  or re.search(r"v?(\d+(?:\.\d+)+)", rel["tag_name"])
+              marketing = m.group(1) if m else rel["tag_name"].lstrip("vV")
+
+              versions.append({
+                  "version": yt_version,
+                  "buildVersion": yt_version,
+                  "marketingVersion": marketing,
+                  "date": rel["published_at"],
+                  "localizedDescription": (rel.get("body") or "").strip(),
+                  "downloadURL": ipa["browser_download_url"],
+                  "size": ipa["size"],
+                  "minOSVersion": E["MIN_OS_VERSION"],
+              })
+
+          if not versions:
+              raise SystemExit(f"No releases with a usable .ipa found in {repo}")
+
+          versions.sort(key=lambda v: v["date"], reverse=True)
+          latest = versions[0]
+
+          repo_meta = get(api)
+          app = {
+              "name": E["APP_NAME"],
+              "bundleIdentifier": E["BUNDLE_ID"],
+              "developerName": E["DEVELOPER_NAME"],
+              "subtitle": E["APP_SUBTITLE"] or (repo_meta.get("description") or "")[:80],
+              "localizedDescription": repo_meta.get("description") or E["APP_NAME"],
+              "iconURL": E["ICON_URL"],
+              "tintColor": E["TINT_COLOR"],
+              "category": E["CATEGORY"],
+              "screenshotURLs": [],
+              "versions": versions,
+              "appPermissions": {"entitlements": [], "privacy": {}},
+              # Legacy top-level fields for older AltStore Classic builds
+              "version": latest["version"],
+              "versionDate": latest["date"],
+              "versionDescription": latest["localizedDescription"],
+              "downloadURL": latest["downloadURL"],
+              "size": latest["size"],
+          }
+
+          source = {
+              "name": E["SOURCE_NAME"],
+              "identifier": E["SOURCE_IDENTIFIER"],
+              "subtitle": E["SOURCE_SUBTITLE"],
+              "description": E["SOURCE_SUBTITLE"],
+              "website": f"https://github.com/{repo}",
+              "iconURL": E["ICON_URL"],
+              "tintColor": E["TINT_COLOR"],
+              "apps": [app],
+              "news": [],
+          }
+
+          with open(E["OUTPUT_FILE"], "w") as f:
+              json.dump(source, f, indent=2, ensure_ascii=False)
+              f.write("\n")
+          print(f"Wrote {E['OUTPUT_FILE']} with {len(versions)} version(s); "
+                f"latest {latest['version']} (marketing {latest['marketingVersion']})")
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$OUTPUT_FILE"
+          if git diff --cached --quiet; then
+            echo "No changes."
+          else
+            git commit -m "Update AltStore source"
+            git push
+          fi
