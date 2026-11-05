@@ -28,7 +28,8 @@ env:
   CATEGORY: "entertainment"
   DEVELOPER_NAME: "itzzace"
   APP_SUBTITLE: ""
-  ICON_URL: ""                       # direct URL to a PNG icon
+  ICON_URL: ""                       # optional override; if empty, the 1024x1024 App Store icon is used
+  ICON_APP_STORE_ID: "544007664"     # YouTube on the App Store
   TINT_COLOR: "#FF0000"
   MIN_OS_VERSION: "17.0"             # the iOS 16 builds are excluded
 
@@ -125,6 +126,24 @@ jobs:
           versions.sort(key=lambda v: v["date"], reverse=True)
           latest = versions[0]
 
+          def resolve_icon():
+              """Official 1024x1024 icon from the App Store listing."""
+              if E["ICON_URL"]:
+                  return E["ICON_URL"]
+              try:
+                  url = f"https://itunes.apple.com/lookup?id={E['ICON_APP_STORE_ID']}&country=us"
+                  req = urllib.request.Request(url, headers={"User-Agent": "altstore-source-builder"})
+                  with urllib.request.urlopen(req) as r:
+                      art = json.load(r)["results"][0]["artworkUrl512"]
+                  return re.sub(r"/\d+x\d+bb\.(?:jpg|png|webp)$", "/1024x1024bb.png", art)
+              except Exception as e:
+                  print(f"::warning::Could not resolve App Store icon: {e}")
+                  return ""
+
+          icon_url = resolve_icon()
+          if not icon_url:
+              raise SystemExit("iconURL is required: set ICON_URL")
+
           repo_meta = get(api)
           app = {
               "name": E["APP_NAME"],
@@ -132,7 +151,7 @@ jobs:
               "developerName": E["DEVELOPER_NAME"],
               "subtitle": E["APP_SUBTITLE"] or (repo_meta.get("description") or "")[:80],
               "localizedDescription": repo_meta.get("description") or E["APP_NAME"],
-              "iconURL": E["ICON_URL"],
+              "iconURL": icon_url,
               "tintColor": E["TINT_COLOR"],
               "category": E["CATEGORY"],
               "screenshotURLs": [],
@@ -152,7 +171,7 @@ jobs:
               "subtitle": E["SOURCE_SUBTITLE"],
               "description": E["SOURCE_SUBTITLE"],
               "website": f"https://github.com/{repo}",
-              "iconURL": E["ICON_URL"],
+              "iconURL": icon_url,
               "tintColor": E["TINT_COLOR"],
               "apps": [app],
               "news": [],
